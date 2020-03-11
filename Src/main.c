@@ -36,14 +36,21 @@
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-struct rando
-{
-	uint32_t seed;
-};
+
+#define VOICE_NUM 2
+#define HARMONIC_NUM 8
+#define DRUNK_RANGE 2
+#define STEP_PERIOD 44100
+//struct rando
+//{
+//	uint32_t seed;
+//};
 typedef struct osc_t
 {
 	float phinc;	// phase increment
 	float phase;	// phase
+	float drunk_multiplier;
+	uint32_t seed;
 }	osc_t;
 
 typedef struct synthVoice
@@ -53,7 +60,7 @@ typedef struct synthVoice
 	int velocity;
 	float volume;
 	float frequency;
-	osc_t osc[2];
+	osc_t osc[HARMONIC_NUM];
 }	synthVoice;
 
 typedef enum
@@ -86,9 +93,8 @@ SPI_HandleTypeDef hspi1;
 
 /* USER CODE BEGIN PV */
 
-#define VOICE_NUM 2
-
 uint32_t count_init;
+uint32_t drunk_period_count;
 int16_t codecBuffer[64];    // 32 samples X 2 channels
 extern I2S_HandleTypeDef       hAudioOutI2s;
 extern I2S_HandleTypeDef       hAudioInI2s;
@@ -106,7 +112,6 @@ int keyboard[128];
 float wavetable[4096];
 // synth globals
 float masterVolume;	// set by controller 20
-float masterVolumeKnob;	// set by controller 20
 // ADSR
 float attack, decay, sustain, release;
 // table lookup oscillator
@@ -143,7 +148,7 @@ static void  USBH_UserProcess_callback  (USBH_HandleTypeDef *pHost, uint8_t vId)
 int main(void)
 {
   /* USER CODE BEGIN 1 */
-	int i, waveType, deglitch;
+	int i, j, waveType, deglitch;
 
   /* USER CODE END 1 */
   
@@ -155,6 +160,7 @@ int main(void)
 
   /* USER CODE BEGIN Init */
   count_init = 0;
+  drunk_period_count = 0;
   pitchbend = 8192;
   for(i = 0; i < 128; i++)
   {
@@ -165,10 +171,14 @@ int main(void)
   {
 	  voice[i].active = INACTIVE;
 	  voice[i].volume = 0.0f;
-	  voice[i].osc[0].phase = voice[i].osc[1].phase = 0.0f;
+	  for(j = 0; j < HARMONIC_NUM; j++){
+		  voice[i].osc[j].phase = 0.0f;
+		  voice[i].osc[j].drunk_multiplier = ((float) (DRUNK_RANGE/2.0f));
+		  voice[i].osc[j].seed = (uint32_t) ((i*HARMONIC_NUM) + j)*16777216;
+	  }
 
   }
-  masterVolume = masterVolumeKnob = 1.0f;
+  masterVolume = 1.0f;
   attack = 0.01;
   release = 0.005;
   sustain = 0.8;
@@ -503,7 +513,7 @@ void ProcessMIDI(midi_package_t pack)
 	if(count_init < 100){
 		return;
 	}
-	int i;
+	int i,j;
 	uint8_t status;
 
 	// Status messages that start with F, for all MIDI channels
@@ -592,7 +602,9 @@ void ProcessMIDI(midi_package_t pack)
 					voice[i].note = pack.evnt1;
 					voice[i].velocity = pack.evnt2;
 					voice[i].volume = 0.0f;
-					voice[i].osc[0].phase = voice[i].osc[1].phase = 0.0f;
+					for(j=0; j<HARMONIC_NUM; j++){
+						voice[i].osc[j].phase = 0.0f;
+					}
 					keyboard[pack.evnt1] = i;
 					break;
 				}
@@ -607,7 +619,6 @@ void ProcessMIDI(midi_package_t pack)
 		case 1:
 			break;
 		case 20 	:
-			masterVolumeKnob = pack.evnt2 * 0.0078125f;
 			break ;
 		case 21 	:
 			break ;
@@ -757,6 +768,19 @@ float osc_samp(osc_t *o)
 }
 
 
+inline uint32_t fast_rand(uint32_t seed){
+	seed = (seed * 196314165) + 907633515;
+	return seed;
+}
+
+
+inline void step_osc(osc_t *o){
+	uint32_t new_seed = fast_rand(o->seed);
+	float new_volume = ((float) new_seed) / (4294967295.0f / DRUNK_RANGE);
+	o->drunk_multiplier = new_volume;
+	o->seed = new_seed;
+}
+
 
 void audioBlock(float *input, float *output, int32_t samples)
 {
@@ -770,26 +794,53 @@ void audioBlock(float *input, float *output, int32_t samples)
 	5 - ADSR knobs
 	6 - dezippering of external controls
 	7 - using the ADC inputs*/
-	masterInc = (masterVolumeKnob - masterVolume) * 0.0625f;
 
 	for(i = 0; i < samples; i += 2)
 	{
+		int step_this_sample;
+		drunk_period_count++;
+		if (drunk_period_count == STEP_PERIOD){
+			step_this_sample = 1;
+			drunk_period_count = 0;
+		}
+		else{
+			step_this_sample = 0;
+		}
 		// all voice synth units
-		masterVolume += masterInc;
 		output[i] = output[(i) + 1] = 0.0f;
 
 		// per voice synth units
 		for(v = 0; v < VOICE_NUM; v++)
 		{
+			int j;
+			if(step_this_sample == 1){
+				for(j=0; j<HARMONIC_NUM; j++){
+					step_osc(&voice[v].osc[j]);
+				}
+			}
 			if(voice[v].active != INACTIVE)
 			{
+//				float waveSum = 0.0f;
 				voice[v].frequency = mtoinc[voice[v].note] * pitchbend1024[pitchbend>>4];
 
 				// sawtooth oscillator phase increment calculation
-				voice[v].osc[0].phinc = voice[v].frequency;
-				voice[v].osc[1].phinc = voice[v].frequency;
+//				voice[v].osc[0].phinc = voice[v].frequency;
+//				voice[v].osc[1].phinc = voice[v].frequency;
 
-				wave = osc_samp(&(voice[v].osc[0])) + osc_samp(&(voice[v].osc[1]));
+//				wave = osc_samp(&(voice[v].osc[0]));// + osc_samp(&(voice[v].osc[1]));
+
+				//Square Wave Shape
+				wave = 0.0f;
+				for(j=0; j<HARMONIC_NUM; j++){
+					int power = (j*2) + 1;
+					voice[v].osc[j].phinc = (voice[v].frequency*power);
+					//TODO: Get rid of the divide
+					wave += (osc_samp(&(voice[v].osc[j]))/power) * voice[v].osc[j].drunk_multiplier;
+				}
+
+
+
+
 				// use voice volume to control the simplest filter
 				f = voice[v].volume * 128.0f;
 				if(f > 127) f = 127;
@@ -822,7 +873,6 @@ void audioBlock(float *input, float *output, int32_t samples)
 			output[(i) + 1] = output[i];
 		}
 	}
-	masterVolume = masterVolumeKnob;
 }
 void BSP_AUDIO_OUT_HalfTransfer_CallBack(void)
 {
